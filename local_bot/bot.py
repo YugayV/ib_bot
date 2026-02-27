@@ -219,9 +219,9 @@ strike_steps = {
 
 # Expiration dates - 3 tenors
 expiration_dates = {
-    'GLD': ['20260220', '20260320', '20260417'],  # Feb 20, Mar 20, Apr 17 2026
-    'SLV': ['20260220', '20260320', '20260417'],  # Feb 20, Mar 20, Apr 17 2026
-    'SPY': ['20260220', '20260320', '20260417'],  # Feb 20, Mar 20, Apr 17 2026
+    'GLD': ['20260320', '20260417', '20260515'],  # Mar 20, Apr 17, May 15 2026
+    'SLV': ['20260320', '20260417', '20260515'],  # Mar 20, Apr 17, May 15 2026
+    'SPY': ['20260320', '20260417', '20260515'],  # Mar 20, Apr 17, May 15 2026
 }
 
 # These will be populated dynamically after fetching current prices
