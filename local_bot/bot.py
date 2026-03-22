@@ -22,6 +22,8 @@ import pytz
 # Load environment variables from .env file
 load_dotenv()
 
+# Global flag to track DB status
+DB_AVAILABLE = False
 
 def get_market_status():
     """
@@ -130,6 +132,9 @@ IB_HOST = os.getenv('IB_HOST', '127.0.0.1')
 IB_PORT = int(os.getenv('IB_PORT', 7497))
 IB_CLIENT_ID = int(os.getenv('IB_CLIENT_ID', 22))
 
+# Common TWS/Gateway ports to try
+TWS_PORTS = [7497, 7496, 4001, 4002]
+
 user_command_messages = {}
 
 
@@ -178,7 +183,14 @@ def get_atm_strikes_option2(current_prices):
     return atm_data
 
 def last_hours_smile(option_type, underlying, expiration, hours):
-    df = get_sql('get_last_smile.sql', option_type=option_type, underlying=underlying, expiration=expiration, hours=hours)
+    if not DB_AVAILABLE:
+        return {}
+
+    try:
+        df = get_sql('get_last_smile.sql', option_type=option_type, underlying=underlying, expiration=expiration, hours=hours)
+    except Exception as e:
+        print(f"Warning: Failed to fetch last smile from DB: {e}")
+        return {}
 
     option_dict = {}
     for index, row in df.iterrows():
@@ -236,6 +248,7 @@ class PriceFetcher(EWrapper, EClient):
         self.prices = {}
         self.price_event = threading.Event()
         self.reqId_to_symbol = {}  # Map reqId -> symbol
+        self.connected_event = threading.Event()  # To track connection success
 
     def error(self, reqId, errorCode, errorString, advancedOrderRejectJson=""):
         if errorCode not in [2104, 2106, 2158]:
@@ -252,36 +265,73 @@ class PriceFetcher(EWrapper, EClient):
                     self.price_event.set()
 
     def nextValidId(self, orderId):
-        pass
+        self.connected_event.set()
 
 
 def fetch_current_prices(host, port, client_id):
-    """Fetch current prices for GLD and SLV"""
-    print("Fetching current ETF prices...")
+    """Fetch current prices for GLD and SLV with port auto-detection"""
+    global IB_PORT
+    
+    # Try the configured port first, then others
+    ports_to_try = [port] + [p for p in TWS_PORTS if p != port]
+    # Remove duplicates preserving order
+    seen = set()
+    ports_to_try = [x for x in ports_to_try if not (x in seen or seen.add(x))]
 
-    fetcher = PriceFetcher()
-    fetcher.connect(host, port, clientId=client_id)
+    for current_port in ports_to_try:
+        print(f"Attempting connection to TWS on port {current_port}...")
+        fetcher = PriceFetcher()
+        
+        try:
+            fetcher.connect(host, current_port, clientId=client_id)
+        except Exception as e:
+            print(f"  Connection failed on port {current_port}: {e}")
+            continue
 
-    api_thread = threading.Thread(target=fetcher.run, daemon=True)
-    api_thread.start()
-    time.sleep(2)  # Wait for connection
+        api_thread = threading.Thread(target=fetcher.run, daemon=True)
+        api_thread.start()
+        
+        # Wait for connection to be established (nextValidId)
+        if not fetcher.connected_event.wait(timeout=3):
+            print(f"  Connection timed out on port {current_port} (or TWS refused)")
+            try:
+                fetcher.disconnect()
+            except:
+                pass
+            continue
+            
+        print(f"✓ Connected to TWS on port {current_port}!")
+        
+        # If we found a working port different from default, update global
+        if current_port != IB_PORT:
+            print(f"Updating global IB_PORT to {current_port}")
+            IB_PORT = current_port
 
-    # Request market data for each symbol
-    for i, symbol in enumerate(symbols):
-        fetcher.reqId_to_symbol[i] = symbol  # Map reqId to symbol
-        contract = Contract()
-        contract.symbol = symbol
-        contract.secType = "STK"
-        contract.exchange = "SMART"
-        contract.currency = "USD"
-        fetcher.reqMktData(i, contract, "", False, False, [])
+        # Request market data for each symbol
+        time.sleep(1)
+        for i, symbol in enumerate(symbols):
+            fetcher.reqId_to_symbol[i] = symbol  # Map reqId to symbol
+            contract = Contract()
+            contract.symbol = symbol
+            contract.secType = "STK"
+            contract.exchange = "SMART"
+            contract.currency = "USD"
+            fetcher.reqMktData(i, contract, "", False, False, [])
 
-    # Wait for prices (max 10 seconds)
-    fetcher.price_event.wait(timeout=10)
-    fetcher.disconnect()
-    time.sleep(1)
+        # Wait for prices (max 10 seconds)
+        got_prices = fetcher.price_event.wait(timeout=10)
+        
+        if not got_prices and not fetcher.prices:
+             print("Warning: Connected but failed to fetch prices.")
+             # We stay connected but return what we have (empty) or try next port?
+             # Usually if connected, port is correct.
+        
+        fetcher.disconnect()
+        time.sleep(1)
+        return fetcher.prices
 
-    return fetcher.prices
+    print("ERROR: Could not connect to TWS on any port.")
+    return {}
 
 
 class IVSmileFetcher(EWrapper, EClient):
@@ -668,6 +718,7 @@ class IBApp(EWrapper, EClient):
         self.connected_event = threading.Event()
         self.subscriptions_paused = False
         self.subscription_lock = threading.Lock()
+        self.last_db_error_time = datetime.datetime.now() - datetime.timedelta(minutes=5)
 
         # Store bid/ask IV and prices per contract
         self.volatilities = {
@@ -949,36 +1000,46 @@ class IBApp(EWrapper, EClient):
         theta_db = 'NULL' if calc_theta is None else calc_theta
         price_db = 'NULL' if optPrice is None else optPrice
 
-        get_sql(
-            'test_update.sql',
-            timestamp=int(datetime.datetime.now().timestamp()),
-            option_type=contract.right,
-            expiration=contract.lastTradeDateOrContractMonth,
-            strike=int(contract.strike),
-            underlying=contract.symbol,
-            data_type=data_type,
-            price=price_db,
-            underlying_price=undPrice,
-            iv=iv_db,
-            mikhail_iv='NULL',  # Not used anymore
-            delta=delta_db,
-            gamma=gamma_db,
-            vega=vega_db,
-            theta=theta_db
-        )
+        if DB_AVAILABLE:
+            try:
+                get_sql(
+                    'test_update.sql',
+                    timestamp=int(datetime.datetime.now().timestamp()),
+                    option_type=contract.right,
+                    expiration=contract.lastTradeDateOrContractMonth,
+                    strike=int(contract.strike),
+                    underlying=contract.symbol,
+                    data_type=data_type,
+                    price=price_db,
+                    underlying_price=undPrice,
+                    iv=iv_db,
+                    mikhail_iv='NULL',  # Not used anymore
+                    delta=delta_db,
+                    gamma=gamma_db,
+                    vega=vega_db,
+                    theta=theta_db
+                )
+            except Exception as e:
+                # Don't spam errors
+                if seconds_to_now(self.last_db_error_time) > 60:
+                    print(f"DB Insert Error: {e}")
+                    self.last_db_error_time = datetime.datetime.now()
 
         print(f"Saved: {contract.symbol} {contract.right} {strike} {data_type} IV={impliedVolatility:.4f}" if impliedVolatility else "")
 
 
 def truncate_clickhouse_data():
     """Truncate the options.greeks table on startup to start fresh"""
+    global DB_AVAILABLE
     print("Truncating ClickHouse options.greeks table...")
     try:
         with get_clickhouse_connection() as client:
             client.execute("TRUNCATE TABLE options.greeks")
         print("✓ ClickHouse table truncated successfully")
+        DB_AVAILABLE = True
     except Exception as e:
-        print(f"Warning: Could not truncate ClickHouse table: {e}")
+        print(f"Warning: Could not truncate ClickHouse table (DB Disabled): {e}")
+        DB_AVAILABLE = False
 
 
 if __name__ == '__main__':

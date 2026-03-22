@@ -66,7 +66,9 @@ python bot.py
 ```
 
 ## Features
-- Connects to TWS on port 7497
-- Stores all IV data in ClickHouse
-- Historical data retrieval
-- IV smile charts with history
+- Monitors SPY, GLD, SLV options
+- Fetches IV smile data from Interactive Brokers (TWS/Gateway)
+- Auto-detects TWS port (7497, 7496, 4001, 4002)
+- Stores data in ClickHouse database (optional, graceful degradation if unavailable)
+- Telegram bot interface for on-demand charts and alerts
+- Detects arbitrage and shape anomalies in IV smile
